@@ -31,6 +31,41 @@ import { incrementRunCompactionCount, persistRunSessionUsage } from "./session-r
 import { createTypingSignaler } from "./typing-mode.js";
 import type { TypingController } from "./typing.js";
 
+const SUBAGENT_COMPLETION_RESOLUTION_PROMPT = [
+  "This turn resumes after a background subagent completion for a user-facing session.",
+  "Before ending the turn, do one of the following:",
+  "- send a user-visible update in your normal assistant voice,",
+  "- use a user-visible messaging tool/action, or",
+  "- call sessions_yield again if you intentionally continue background orchestration.",
+  "Do not end silently with NO_REPLY unless you already completed a user-visible send or explicitly yielded again.",
+].join("\n");
+
+const SUBAGENT_COMPLETION_RESOLUTION_FALLBACK =
+  "I received the background result and I’m continuing from here.";
+
+function appendExtraSystemPrompt(base: string | undefined, extra: string | undefined) {
+  if (!extra) {
+    return base;
+  }
+  if (!base?.trim()) {
+    return extra;
+  }
+  return `${base}\n\n${extra}`;
+}
+
+function isUserFacingSubagentCompletionFollowup(queued: FollowupRun): boolean {
+  const provenance = queued.run.inputProvenance;
+  if (provenance?.kind !== "inter_session" || provenance.sourceTool !== "subagent_announce") {
+    return false;
+  }
+  return !isInternalMessageChannel(
+    resolveOriginMessageProvider({
+      originatingChannel: queued.originatingChannel,
+      provider: queued.run.messageProvider,
+    }),
+  );
+}
+
 export function createFollowupRunner(params: {
   opts?: GetReplyOptions;
   typing: TypingController;
@@ -150,6 +185,7 @@ export function createFollowupRunner(params: {
       }
       let autoCompactionCount = 0;
       let runResult: Awaited<ReturnType<typeof runEmbeddedPiAgent>>;
+      const requiresVisibleResolution = isUserFacingSubagentCompletionFollowup(queued);
       let fallbackProvider = queued.run.provider;
       let fallbackModel = queued.run.model;
       let activeSessionEntry =
@@ -218,7 +254,10 @@ export function createFollowupRunner(params: {
                 config: queued.run.config,
                 skillsSnapshot: queued.run.skillsSnapshot,
                 prompt: queued.prompt,
-                extraSystemPrompt: queued.run.extraSystemPrompt,
+                extraSystemPrompt: appendExtraSystemPrompt(
+                  queued.run.extraSystemPrompt,
+                  requiresVisibleResolution ? SUBAGENT_COMPLETION_RESOLUTION_PROMPT : undefined,
+                ),
                 ownerNumbers: queued.run.ownerNumbers,
                 enforceFinalTag: queued.run.enforceFinalTag,
                 provider,
@@ -305,9 +344,6 @@ export function createFollowupRunner(params: {
       }
 
       const payloadArray = runResult.payloads ?? [];
-      if (payloadArray.length === 0) {
-        return;
-      }
       const sanitizedPayloads = payloadArray.flatMap((payload) => {
         const text = payload.text;
         if (!text || !text.includes("HEARTBEAT_OK")) {
@@ -320,7 +356,7 @@ export function createFollowupRunner(params: {
         }
         return [{ ...payload, text: stripped.text }];
       });
-      const finalPayloads = resolveFollowupDeliveryPayloads({
+      let finalPayloads = resolveFollowupDeliveryPayloads({
         cfg: queued.run.config,
         payloads: sanitizedPayloads,
         messageProvider: queued.run.messageProvider,
@@ -332,6 +368,19 @@ export function createFollowupRunner(params: {
         sentTargets: runResult.messagingToolSentTargets,
         sentTexts: runResult.messagingToolSentTexts,
       });
+
+      const hadVisibleUserAction = Boolean(
+        runResult.didSendViaMessagingTool || runResult.didSendDeterministicApprovalPrompt,
+      );
+      const didYieldAgain = runResult.meta?.yieldDetected === true;
+      if (
+        requiresVisibleResolution &&
+        finalPayloads.length === 0 &&
+        !hadVisibleUserAction &&
+        !didYieldAgain
+      ) {
+        finalPayloads = [{ text: SUBAGENT_COMPLETION_RESOLUTION_FALLBACK }];
+      }
 
       if (finalPayloads.length === 0) {
         return;

@@ -1003,6 +1003,97 @@ describe("createFollowupRunner messaging tool dedupe", () => {
   });
 });
 
+describe("createFollowupRunner subagent completion resolution", () => {
+  function createResolutionRunner() {
+    return createFollowupRunner({
+      typing: createMockTypingController(),
+      typingMode: "instant",
+      defaultModel: "anthropic/claude-opus-4-6",
+    });
+  }
+
+  function createSubagentCompletionQueuedRun(
+    overrides: Partial<Omit<FollowupRun, "run">> & { run?: Partial<FollowupRun["run"]> } = {},
+  ): FollowupRun {
+    return createQueuedRun({
+      originatingChannel: "slack",
+      originatingTo: "channel:C123",
+      originatingThreadId: "171.222",
+      run: {
+        messageProvider: "slack",
+        inputProvenance: {
+          kind: "inter_session",
+          sourceTool: "subagent_announce",
+        },
+      },
+      ...overrides,
+      run: {
+        messageProvider: "slack",
+        inputProvenance: {
+          kind: "inter_session",
+          sourceTool: "subagent_announce",
+        },
+        ...overrides.run,
+      },
+    });
+  }
+
+  it("sends a fallback update when a subagent completion wake would otherwise end silently", async () => {
+    runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [{ text: "NO_REPLY" }],
+      meta: { yieldDetected: false },
+      didSendViaMessagingTool: false,
+    });
+
+    const runner = createResolutionRunner();
+    await runner(createSubagentCompletionQueuedRun());
+
+    const call = runEmbeddedPiAgentMock.mock.calls.at(-1)?.[0] as
+      | {
+          extraSystemPrompt?: string;
+        }
+      | undefined;
+    expect(call?.extraSystemPrompt).toContain("Do not end silently with NO_REPLY");
+    expect(routeReplyMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "slack",
+        to: "channel:C123",
+        threadId: "171.222",
+        payload: expect.objectContaining({
+          text: "I received the background result and I’m continuing from here.",
+        }),
+      }),
+    );
+  });
+
+  it("does not send a fallback when the resumed turn already used a messaging tool", async () => {
+    runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [],
+      meta: { yieldDetected: false },
+      didSendViaMessagingTool: true,
+      messagingToolSentTexts: ["sent already"],
+    });
+
+    const runner = createResolutionRunner();
+    await runner(createSubagentCompletionQueuedRun());
+
+    expect(routeReplyMock).not.toHaveBeenCalled();
+  });
+
+  it("does not send a fallback when the resumed turn explicitly yields again", async () => {
+    runEmbeddedPiAgentMock.mockResolvedValueOnce({
+      payloads: [],
+      meta: { yieldDetected: true },
+      didSendViaMessagingTool: false,
+    });
+
+    const runner = createResolutionRunner();
+    await runner(createSubagentCompletionQueuedRun());
+
+    expect(routeReplyMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("createFollowupRunner typing cleanup", () => {
   async function runTypingCase(agentResult: Record<string, unknown>) {
     const typing = createMockTypingController();
